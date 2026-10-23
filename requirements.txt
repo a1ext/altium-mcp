@@ -134,6 +134,7 @@ pydantic==2.10.6 \
     --hash=sha256:427d664bf0b8a2b34ff5dd0f5a18df00591adcee7198fbd71981054cef37b584 \
     --hash=sha256:ca5daa827cce33de7a42be142548b0096bf05a7e7b365aebfa5f8eeec7128236
     # via
+    #   altiummcp
     #   mcp
     #   pydantic-settings
 pydantic-core==2.27.2 \

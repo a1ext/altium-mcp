@@ -1684,7 +1684,7 @@ var
     Iter, ChildIter : ISch_Iterator;
     Prim, Param, Obj : ISch_GraphicalObject;
     Impl : ISch_Implementation;
-    Rec, Kind, CurLib, PName, PVal, Adopted, Missing, Ok : String;
+    Rec, Kind, CurLib, PName, PVal, Adopted, Missing, Ok, Target, Mode : String;
     Proj : IProject;
     i, fld, vtx, PartCount, GfxCount, PinCount : Integer;
     HotX, HotY : Integer;
@@ -1703,17 +1703,55 @@ begin
     Placement := TStringList.Create;
     if FileExists(PlacementPath) then Placement.LoadFromFile(PlacementPath);
 
+    // Optional first record TARGET|<'current' | full path of a .SchDoc |
+    // name of an open unsaved sheet>. Without it a new sheet is created.
+    // With it the build APPENDS to that sheet, so a caller can place parts,
+    // read the measured pin map, then wire the same sheet in a second call.
+    Target := '';
+    if (Spec.Count > 0) then
+        if (GetFieldFromPipeString(Spec[0], 0) = 'TARGET') then
+            Target := Trim(GetFieldFromPipeString(Spec[0], 1));
+
     // SAFETY: opening a symbol library makes THAT document current. Stray
     // components were once registered into shared libraries on a read-only
-    // share exactly that way. Create the target up front, hold it by
+    // share exactly that way. Resolve the target up front, hold it by
     // reference, and verify it is a schematic (32) not a library (33) once.
-    GetWorkSpace.DM_CreateNewDocument('SCH');
-    TargetDoc := SchServer.GetCurrentSchDocument;
+    TargetDoc := nil;
+    if (Target = '') then
+    begin
+        Mode := 'new';
+        GetWorkSpace.DM_CreateNewDocument('SCH');
+        TargetDoc := SchServer.GetCurrentSchDocument;
+    end
+    else
+    begin
+        Mode := 'append';
+        if (UpperCase(Target) = 'CURRENT') then
+            TargetDoc := SchServer.GetCurrentSchDocument
+        else
+        begin
+            TargetDoc := SchServer.GetSchDocumentByPath(Target);
+            if (TargetDoc = nil) and FileExists(Target) then
+            begin
+                Client.OpenDocument('SCH', Target);
+                TargetDoc := SchServer.GetSchDocumentByPath(Target);
+            end;
+            // An unsaved sheet is known only by its name (e.g. Sheet2.SchDoc)
+            if (TargetDoc = nil) then
+            begin
+                LibDoc := SchServer.GetCurrentSchDocument;
+                if (LibDoc <> nil) then
+                    if (UpperCase(ExtractFileName(LibDoc.DocumentName)) = UpperCase(ExtractFileName(Target))) then
+                        TargetDoc := LibDoc;
+            end;
+        end;
+    end;
     if (TargetDoc = nil) then
     begin
         Spec.Free;
         Placement.Free;
-        Result := '{"success": false, "error": "could not create a target schematic"}';
+        Result := '{"success": false, "error": "could not resolve target schematic: ' +
+                  JSONEscapeString(Target) + '"}';
         Exit;
     end;
     if (TargetDoc.ObjectID <> 32) then
@@ -1729,8 +1767,10 @@ begin
     // they showed up as [13]/[14] in Base.PrjPcb instead of under Free
     // Documents. A generated sheet must not modify an existing project
     // unless the caller asks for that, so detach it again.
+    // An appended sheet is the caller's own document - leave its project alone
     Adopted := '';
-    Proj := GetWorkspace.DM_FocusedProject;
+    Proj := nil;
+    if (Mode = 'new') then Proj := GetWorkspace.DM_FocusedProject;
     if (Proj <> nil) then
         if (Pos('Free Documents', Proj.DM_ProjectFileName) = 0) then
         begin
@@ -1975,6 +2015,11 @@ begin
     SchServer.ProcessControl.PostProcess(TargetDoc, '');
     TargetDoc.GraphicallyInvalidate;
 
+    // Opening symbol libraries left a SchLib focused; bring the sheet back so
+    // a follow-up call with TARGET|current lands on it, not on the library
+    if Client.IsDocumentOpen(TargetDoc.DocumentName) then
+        Client.ShowDocument(Client.GetDocumentByPath(TargetDoc.DocumentName));
+
     // Pin map: absolute connection point of every placed pin, so a caller can
     // route from measured coordinates instead of predicting rotated offsets.
     PinMap := TStringList.Create;
@@ -1989,9 +2034,11 @@ begin
         Param := ChildIter.FirstSchObject;
         while (Param <> nil) do
         begin
+            // Keyed by pin NUMBER: names repeat (GND, VDD, NC) and a
+            // name-keyed map silently kept only the last of them
             GetPinHotEnd(Param, HotX, HotY);
-            PinMap.Add('PIN|' + Prim.Designator.Text + '|' + Param.Name + '|' +
-                       IntToStr(HotX) + '|' + IntToStr(HotY));
+            PinMap.Add('PIN|' + Prim.Designator.Text + '|' + Param.Designator + '|' +
+                       Param.Name + '|' + IntToStr(HotX) + '|' + IntToStr(HotY));
             PinCount := PinCount + 1;
             Param := ChildIter.NextSchObject;
         end;
@@ -2003,7 +2050,8 @@ begin
     PinMap.Free;
 
     if (Missing = '') then Ok := 'true' else Ok := 'false';
-    Result := '{"success": ' + Ok + ', "detached_from": "' + Adopted + '", "sheet": "' + TargetDoc.DocumentName +
+    Result := '{"success": ' + Ok + ', "mode": "' + Mode + '", "detached_from": "' + Adopted +
+              '", "sheet": "' + JSONEscapeString(TargetDoc.DocumentName) +
               '", "parts": ' + IntToStr(PartCount) +
               ', "graphics": ' + IntToStr(GfxCount) +
               ', "pins": ' + IntToStr(PinCount) +

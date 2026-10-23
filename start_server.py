@@ -27,6 +27,10 @@ SCRIPT_DIR = Path(__file__).parent
 
 REQUIREMENTS = [
     "mcp[cli]==1.5.0",
+    # mcp 1.5.0 imports pydantic._internal._typing_extra.eval_type_backport,
+    # which newer pydantic removed; unpinned, pip pulls a pydantic that makes
+    # the server die on import ("Connection closed" in Claude Desktop).
+    "pydantic>=2.7.2,<2.11",
     "pillow>=11.1.0",
     "pywin32>=310",
 ]

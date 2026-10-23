@@ -23,6 +23,15 @@ import glob
 import re
 
 from altium_files import read_altium_text, write_altium_text
+
+# Without DPI awareness, on a scaled display (e.g. 200 %) GetWindowRect
+# returns logical pixels while BitBlt copies physical ones, so screenshots
+# showed only the top-left quarter of the Altium window
+try:
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor aware
+except Exception:
+    pass
 from outjob_parser import parse_outjob
 
 # Configure logging
@@ -1444,12 +1453,111 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
     result = response.get("result", {})
     return json.dumps(result, indent=2) if not isinstance(result, str) else result
 
-@mcp.tool()
-async def build_schematic(ctx: Context, parts: list, wires: list = None,
-                          junctions: list = None, net_labels: list = None,
-                          power_ports: list = None, notes: list = None) -> str:
+PIN_MAP_PATH = Path("C:/Users/Public/altium_mcp/pin_map.txt")
+
+
+async def _run_circuit_spec(lines: list) -> dict:
+    """Write a circuit spec, run build_circuit, return the result with pin map.
+
+    pin_map is {designator: {pin_number: {"name": .., "x": .., "y": ..}}}.
     """
-    Build a wired schematic on a NEW sheet from a circuit description.
+    spec_path = Path("C:/Users/Public/altium_mcp/circuit_spec.txt")
+    spec_path.parent.mkdir(parents=True, exist_ok=True)
+    # A stale map from an earlier run must never be read as this run's result
+    if PIN_MAP_PATH.is_file():
+        PIN_MAP_PATH.unlink()
+    # Part descriptions carry characters that are not plain ASCII
+    write_altium_text(spec_path, "\n".join(lines) + "\n")
+
+    response = await altium_bridge.execute_command("build_circuit", {})
+    if not response.get("success", False):
+        return {"success": False, "error": response.get("error", "unknown error")}
+
+    result = response.get("result", {})
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return {"success": False, "error": result}
+
+    pin_map = {}
+    if PIN_MAP_PATH.is_file():
+        for line in read_altium_text(PIN_MAP_PATH).splitlines():
+            f = line.strip().split("|")
+            if len(f) == 6 and f[0] == "PIN":
+                pin_map.setdefault(f[1], {})[f[2]] = {
+                    "name": f[3], "x": int(f[4]), "y": int(f[5])}
+    result["pin_map"] = pin_map
+    return result
+
+
+def _resolve_pin(ref: str, pin_map: dict):
+    """'U1.13' -> (x, y) of U1 pin number 13's electrical end."""
+    des, _, num = ref.rpartition(".")
+    pin = pin_map.get(des, {}).get(num)
+    if pin is None:
+        raise ValueError(f"pin reference '{ref}' not found on the target sheet "
+                         "(use DESIGNATOR.PIN_NUMBER, e.g. U1.13)")
+    return pin["x"], pin["y"]
+
+
+def _uses_pin_refs(wires, junctions, net_labels, power_ports) -> bool:
+    if any(isinstance(v, str) for route in (wires or []) for v in route):
+        return True
+    return any("pin" in o for o in (junctions or []) + (net_labels or []) + (power_ports or []))
+
+
+def _xy(obj: dict, pin_map: dict):
+    if "pin" in obj:
+        return _resolve_pin(obj["pin"], pin_map)
+    return int(obj["x"]), int(obj["y"])
+
+
+@mcp.tool()
+async def get_schematic_pin_map(ctx: Context, target: str = "current",
+                                designators: list = None) -> str:
+    """
+    Read the measured electrical connection point of every pin on a sheet.
+
+    Read-only: changes nothing. Use it after placing parts (build_schematic
+    with parts only) to get exact coordinates before routing wires, or to
+    wire into a sheet that was drawn by hand.
+
+    Args:
+        target: "current" (the focused schematic), the full path of a
+            .SchDoc, or the name of an open unsaved sheet (e.g. "Sheet2.SchDoc").
+        designators: optional filter, e.g. ["U1", "C3"].
+
+    Returns:
+        JSON {sheet, pin_map: {designator: {pin_number: {name, x, y}}}} in mils.
+    """
+    result = await _run_circuit_spec([f"TARGET|{target}"])
+    if not result.get("success", False):
+        return json.dumps(result)
+    pin_map = result["pin_map"]
+    if designators:
+        pin_map = {d: pin_map[d] for d in designators if d in pin_map}
+    return json.dumps({"success": True, "sheet": result.get("sheet"),
+                       "pin_map": pin_map}, indent=2)
+
+
+@mcp.tool()
+async def build_schematic(ctx: Context, parts: list = None, wires: list = None,
+                          junctions: list = None, net_labels: list = None,
+                          power_ports: list = None, notes: list = None,
+                          target: str = "") -> str:
+    """
+    Build a wired schematic from a circuit description, on a NEW sheet or
+    appended to an existing one.
+
+    Recommended two-pass flow:
+      1. build_schematic(parts=[...]) - places parts on a new sheet and returns
+         its name plus the measured pin_map.
+      2. build_schematic(target=<sheet from step 1>, wires=[...], ...) - wires
+         the SAME sheet. Wire points, junctions, net labels and power ports
+         may name a pin instead of coordinates ("U1.13" = designator U1, pin
+         NUMBER 13); they are resolved from the measured pin map of the target,
+         so a wire lands exactly on the pin's electrical end.
 
     READ dev/SCHEMATIC_CONVENTIONS.md BEFORE CALLING. This tool places exactly
     what it is given; it does not lay out or correct spacing. The conventions
@@ -1477,23 +1585,43 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
             symbol, x, y (mils). Optional: design_item_id, orientation (0-3),
             mirror (0/1), comment, description, footprint,
             parameters ({name: value}).
-        wires: each a flat list of alternating x,y in mils, e.g.
-            [3900, 3000, 5300, 3000, 5300, 4900] - two segments, three points.
-        junctions: [{"x":..,"y":..}] - only where 3+ branches actually meet.
-        net_labels: [{"x":..,"y":..,"orientation":0,"text":"LED+"}] - the
-            coordinate must lie on a wire.
+        wires: each a flat list of points; a point is either two numbers x, y
+            (mils) or one pin reference string, e.g.
+            ["U1.2", 3000, 2500, "C1.1"] - pin, corner, pin.
+        junctions: [{"x":..,"y":..}] or [{"pin":"U1.2"}] - only where 3+
+            branches actually meet.
+        net_labels: [{"x":..,"y":..,"orientation":0,"text":"LED+"}] (or
+            "pin" instead of x/y) - the coordinate must lie on a wire.
         power_ports: [{"x":..,"y":..,"orientation":3,"style":5,"text":"GND",
-            "show_net_name":false}]. Harvest style/orientation from an existing
-            sheet rather than guessing: 5 = digital ground, 2 = supply bar.
+            "show_net_name":false}] (or "pin" instead of x/y). Harvest
+            style/orientation from an existing sheet rather than guessing:
+            5 = digital ground, 2 = supply bar.
         notes: [{"x":..,"y":..,"text":".."}] free text.
+        target: "" = create a new sheet; "current", a .SchDoc path, or the
+            name of an open unsaved sheet = append to that sheet. Pin
+            references need an existing target (place parts first).
 
     Returns:
-        JSON with the created sheet name, counts, and the pin map - every
-        placed pin's true connection point, for routing a follow-up call.
+        JSON with the sheet name, mode (new/append), counts, and the pin map
+        {designator: {pin_number: {name, x, y}}} - every placed pin's true
+        connection point, for routing a follow-up call.
     """
-    logger.info(f"Building schematic: {len(parts)} parts")
+    parts = parts or []
+    logger.info(f"Building schematic: {len(parts)} parts, target='{target}'")
 
-    lines = []
+    # Resolve pin references against the sheet as it is now
+    pin_map = {}
+    if _uses_pin_refs(wires, junctions, net_labels, power_ports):
+        if not target:
+            return json.dumps({"success": False,
+                               "error": "pin references need an existing target sheet: "
+                                        "place the parts first, then wire with target=<sheet>"})
+        current = await _run_circuit_spec([f"TARGET|{target}"])
+        if not current.get("success", False):
+            return json.dumps(current)
+        pin_map = current["pin_map"]
+
+    lines = [f"TARGET|{target}"] if target else []
     for p in parts:
         for key in ("designator", "symbol_library", "symbol", "x", "y"):
             if key not in p:
@@ -1522,52 +1650,45 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
                                         ".SchLib file (integrated libraries such as .IntLib "
                                         f"are not supported): {lib}"})
 
-    for route in (wires or []):
-        if len(route) < 4 or len(route) % 2:
-            return json.dumps({"success": False,
-                               "error": f"wire needs an even count of >=4 coords: {route}"})
-        lines.append("WIRE|" + "|".join(str(int(v)) for v in route))
-    for j in (junctions or []):
-        lines.append(f"JUNCTION|{int(j['x'])}|{int(j['y'])}")
-    for n in (net_labels or []):
-        lines.append("NETLABEL|{}|{}|{}|{}".format(
-            int(n["x"]), int(n["y"]), int(n.get("orientation", 0)), n["text"]))
-    for pw in (power_ports or []):
-        lines.append("POWER|{}|{}|{}|{}|{}|{}".format(
-            int(pw["x"]), int(pw["y"]), int(pw.get("orientation", 3)),
-            int(pw.get("style", 5)), pw["text"],
-            1 if pw.get("show_net_name") else 0))
+    try:
+        for route in (wires or []):
+            pts, nums = [], []
+            for v in route:
+                if isinstance(v, str):
+                    if nums:
+                        raise ValueError(f"odd coordinate before pin reference in wire {route}")
+                    pts.append(_resolve_pin(v, pin_map))
+                else:
+                    nums.append(int(v))
+                    if len(nums) == 2:
+                        pts.append(tuple(nums))
+                        nums = []
+            if nums or len(pts) < 2:
+                raise ValueError(f"wire needs >= 2 complete points: {route}")
+            lines.append("WIRE|" + "|".join(f"{x}|{y}" for x, y in pts))
+        for j in (junctions or []):
+            x, y = _xy(j, pin_map)
+            lines.append(f"JUNCTION|{x}|{y}")
+        for n in (net_labels or []):
+            x, y = _xy(n, pin_map)
+            lines.append("NETLABEL|{}|{}|{}|{}".format(
+                x, y, int(n.get("orientation", 0)), n["text"]))
+        for pw in (power_ports or []):
+            x, y = _xy(pw, pin_map)
+            lines.append("POWER|{}|{}|{}|{}|{}|{}".format(
+                x, y, int(pw.get("orientation", 3)),
+                int(pw.get("style", 5)), pw["text"],
+                1 if pw.get("show_net_name") else 0))
+    except ValueError as e:
+        return json.dumps({"success": False, "error": str(e)})
     for nt in (notes or []):
         lines.append(f"NOTE|{int(nt['x'])}|{int(nt['y'])}|{nt['text']}")
 
-    spec_path = Path("C:/Users/Public/altium_mcp/circuit_spec.txt")
-    spec_path.parent.mkdir(parents=True, exist_ok=True)
-    # Part descriptions carry characters that are not plain ASCII
-    write_altium_text(spec_path, "\n".join(lines) + "\n")
-
-    response = await altium_bridge.execute_command("build_circuit", {})
-    if not response.get("success", False):
-        return json.dumps({"success": False,
-                           "error": response.get("error", "unknown error")})
-
-    result = response.get("result", {})
-    if isinstance(result, str):
-        try:
-            result = json.loads(result)
-        except ValueError:
-            return result
-
-    # Hand back the measured pin map so the caller can route a second pass
-    pin_map = {}
-    pm = Path("C:/Users/Public/altium_mcp/pin_map.txt")
-    if pm.is_file():
-        for line in read_altium_text(pm).splitlines():
-            f = line.strip().split("|")
-            if len(f) == 5 and f[0] == "PIN":
-                pin_map.setdefault(f[1], {})[f[2]] = [int(f[3]), int(f[4])]
-    result["pin_map"] = pin_map
-    result["pin_map_note"] = ("Absolute electrical connection points. Route "
-                              "wires from these, not from predicted offsets.")
+    result = await _run_circuit_spec(lines)
+    if "pin_map" in result:
+        result["pin_map_note"] = ("Absolute electrical connection points keyed by "
+                                  "pin number. Route from these (or pass 'DES.PIN' "
+                                  "references), not from predicted offsets.")
     return json.dumps(result, indent=2)
 
 @mcp.tool()
@@ -2367,7 +2488,13 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                     saveDC.DeleteDC()
                     mfcDC.DeleteDC()
                     win32gui.ReleaseDC(hwnd, hwndDC)
-                    
+
+                    # A physical-pixel capture on a high-DPI screen is too
+                    # large to return; scale it to a readable size
+                    if img.width > 1920:
+                        scale = 1920 / img.width
+                        img = img.resize((1920, int(img.height * scale)), Image.LANCZOS)
+
                     # Convert to base64
                     buffer = io.BytesIO()
                     img.save(buffer, format='PNG')
