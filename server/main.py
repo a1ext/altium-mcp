@@ -1545,7 +1545,8 @@ async def get_schematic_pin_map(ctx: Context, target: str = "current",
 async def build_schematic(ctx: Context, parts: list = None, wires: list = None,
                           junctions: list = None, net_labels: list = None,
                           power_ports: list = None, notes: list = None,
-                          target: str = "") -> str:
+                          target: str = "", spec_file: str = "",
+                          return_pin_map: bool = True) -> str:
     """
     Build a wired schematic from a circuit description, on a NEW sheet or
     appended to an existing one.
@@ -1599,13 +1600,66 @@ async def build_schematic(ctx: Context, parts: list = None, wires: list = None,
         notes: [{"x":..,"y":..,"text":".."}] free text.
         target: "" = create a new sheet; "current", a .SchDoc path, or the
             name of an open unsaved sheet = append to that sheet. Pin
-            references need an existing target (place parts first).
+            references passed together with parts are resolved after the
+            parts are placed (the two passes run automatically).
+        spec_file: path of a JSON file holding any of the keys above
+            (parts, wires, junctions, net_labels, power_ports, notes,
+            target). Use it for large sheets instead of passing the data
+            inline. Arguments passed explicitly take precedence over the
+            file's values.
+        return_pin_map: False leaves the pin map out of the result (only
+            per-designator pin counts are returned), keeping the response
+            small when the caller does not route from it.
 
     Returns:
         JSON with the sheet name, mode (new/append), counts, and the pin map
         {designator: {pin_number: {name, x, y}}} - every placed pin's true
         connection point, for routing a follow-up call.
     """
+    if spec_file:
+        try:
+            with open(spec_file, "r", encoding="utf-8") as f:
+                spec = json.load(f)
+        except (OSError, ValueError) as e:
+            return json.dumps({"success": False, "error": f"cannot read spec_file: {e}"})
+        if not isinstance(spec, dict):
+            return json.dumps({"success": False, "error": "spec_file must hold a JSON object"})
+        parts = parts if parts is not None else spec.get("parts")
+        wires = wires if wires is not None else spec.get("wires")
+        junctions = junctions if junctions is not None else spec.get("junctions")
+        net_labels = net_labels if net_labels is not None else spec.get("net_labels")
+        power_ports = power_ports if power_ports is not None else spec.get("power_ports")
+        notes = notes if notes is not None else spec.get("notes")
+        target = target or spec.get("target", "")
+
+    # Pin references in the same call as parts: place the parts first, then
+    # wire the resulting sheet from its measured pin map
+    if parts and _uses_pin_refs(wires, junctions, net_labels, power_ports):
+        placed = await _build_schematic(parts, None, None, None, None, None, target)
+        if not placed.get("success", False):
+            return json.dumps(placed)
+        result = await _build_schematic([], wires, junctions, net_labels, power_ports,
+                                        notes, placed["sheet"])
+        if result.get("success", False):
+            result["mode"] = placed.get("mode", result.get("mode"))
+            result["parts"] = placed.get("parts", 0)
+    else:
+        result = await _build_schematic(parts, wires, junctions, net_labels, power_ports,
+                                        notes, target)
+
+    if "pin_map" in result:
+        if return_pin_map:
+            result["pin_map_note"] = ("Absolute electrical connection points keyed by "
+                                      "pin number. Route from these (or pass 'DES.PIN' "
+                                      "references), not from predicted offsets.")
+        else:
+            result["pin_counts"] = {d: len(p) for d, p in result.pop("pin_map").items()}
+    return json.dumps(result, indent=2)
+
+
+async def _build_schematic(parts, wires, junctions, net_labels, power_ports, notes,
+                           target) -> dict:
+    """Body of build_schematic: one build_circuit run, result as a dict."""
     parts = parts or []
     logger.info(f"Building schematic: {len(parts)} parts, target='{target}'")
 
@@ -1613,20 +1667,20 @@ async def build_schematic(ctx: Context, parts: list = None, wires: list = None,
     pin_map = {}
     if _uses_pin_refs(wires, junctions, net_labels, power_ports):
         if not target:
-            return json.dumps({"success": False,
-                               "error": "pin references need an existing target sheet: "
-                                        "place the parts first, then wire with target=<sheet>"})
+            return {"success": False,
+                    "error": "pin references need an existing target sheet: "
+                             "place the parts first, then wire with target=<sheet>"}
         current = await _run_circuit_spec([f"TARGET|{target}"])
         if not current.get("success", False):
-            return json.dumps(current)
+            return current
         pin_map = current["pin_map"]
 
     lines = [f"TARGET|{target}"] if target else []
     for p in parts:
         for key in ("designator", "symbol_library", "symbol", "x", "y"):
             if key not in p:
-                return json.dumps({"success": False,
-                                   "error": f"part missing required key '{key}': {p}"})
+                return {"success": False,
+                        "error": f"part missing required key '{key}': {p}"}
         lines.append("PART|{}|{}|{}|{}|{}|{}|{}|{}".format(
             p["designator"], p["symbol_library"], p["symbol"],
             p.get("design_item_id", ""), int(p["x"]), int(p["y"]),
@@ -1645,10 +1699,10 @@ async def build_schematic(ctx: Context, parts: list = None, wires: list = None,
     # which used to give an empty sheet reported as success (issue #19)
     for lib in sorted({str(p["symbol_library"]) for p in parts}):
         if not lib.lower().endswith(".schlib") or not os.path.isfile(lib):
-            return json.dumps({"success": False,
-                               "error": "symbol_library must be the full path of an existing "
-                                        ".SchLib file (integrated libraries such as .IntLib "
-                                        f"are not supported): {lib}"})
+            return {"success": False,
+                    "error": "symbol_library must be the full path of an existing "
+                             ".SchLib file (integrated libraries such as .IntLib "
+                             f"are not supported): {lib}"}
 
     try:
         for route in (wires or []):
@@ -1680,16 +1734,11 @@ async def build_schematic(ctx: Context, parts: list = None, wires: list = None,
                 int(pw.get("style", 5)), pw["text"],
                 1 if pw.get("show_net_name") else 0))
     except ValueError as e:
-        return json.dumps({"success": False, "error": str(e)})
+        return {"success": False, "error": str(e)}
     for nt in (notes or []):
         lines.append(f"NOTE|{int(nt['x'])}|{int(nt['y'])}|{nt['text']}")
 
-    result = await _run_circuit_spec(lines)
-    if "pin_map" in result:
-        result["pin_map_note"] = ("Absolute electrical connection points keyed by "
-                                  "pin number. Route from these (or pass 'DES.PIN' "
-                                  "references), not from predicted offsets.")
-    return json.dumps(result, indent=2)
+    return await _run_circuit_spec(lines)
 
 @mcp.tool()
 async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
