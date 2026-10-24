@@ -11,17 +11,19 @@
     "entry_point": "start_server.py",
     "mcp_config": {
       "command": "python",
-      "args": ["${__dirname}/start_server.py"]
+      "args": [
+        "${__dirname}/start_server.py"
+      ]
     }
   },
   "tools": [
     {
       "name": "get_output_job_containers",
-      "description": "Get all available output job containers from a specified OutJob file"
+      "description": "List the output containers of every output group of an OutJob (the given one, else the active project's)"
     },
     {
       "name": "run_output_jobs",
-      "description": "Run specified output job containers"
+      "description": "Run OutJob output containers by name and report the files written"
     },
     {
       "name": "get_outjob_settings",
@@ -29,7 +31,7 @@
     },
     {
       "name": "get_project_info",
-      "description": "Get the focused project's parameters, documents with unsaved-changes state, sheet count and variants"
+      "description": "Get the active project's parameters, documents with unsaved-changes state, sheet count and variants"
     },
     {
       "name": "get_project_components",
@@ -37,7 +39,7 @@
     },
     {
       "name": "get_erc_violations",
-      "description": "Compile the focused project in memory and list ERC/compiler violations by level"
+      "description": "Compile the active project in memory and list ERC/compiler violations by level"
     },
     {
       "name": "get_board_summary",
@@ -82,6 +84,10 @@
     {
       "name": "create_symbols_batch",
       "description": "Create many schematic symbols in one script run from a plain-text spec file"
+    },
+    {
+      "name": "get_schematic_pin_map",
+      "description": "Read the measured connection point of every pin on a schematic sheet (read-only), to wire parts placed by build_schematic"
     },
     {
       "name": "build_schematic",

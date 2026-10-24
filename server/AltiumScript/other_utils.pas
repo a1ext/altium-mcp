@@ -24,6 +24,113 @@ begin
     end;
 end;
 
+// The design project the user works in. A script always sees "Free
+// Documents" or its own script project as DM_FocusedProject, so prefer the
+// project owning the active document, then the focused project if it is a
+// PCB project, then the first open PCB project.
+function GetActiveProject(Dummy: Integer): IProject;
+var
+    WS       : IWorkspace;
+    Prj      : IProject;
+    i, j     : Integer;
+    DocPath  : String;
+begin
+    Result := nil;
+    WS := GetWorkspace;
+    if (WS = nil) then Exit;
+    DocPath := '';
+    if (Client.CurrentView <> nil) then
+        if (Client.CurrentView.OwnerDocument <> nil) then
+            DocPath := LowerCase(Client.CurrentView.OwnerDocument.FileName);
+    if (DocPath <> '') then
+        for j := 0 to WS.DM_ProjectCount - 1 do
+        begin
+            Prj := WS.DM_Projects(j);
+            for i := 0 to Prj.DM_LogicalDocumentCount - 1 do
+                if (LowerCase(Prj.DM_LogicalDocuments(i).DM_FullPath) = DocPath) then
+                begin
+                    Result := Prj;
+                    Exit;
+                end;
+        end;
+    Prj := WS.DM_FocusedProject;
+    if (Prj <> nil) then
+        if (UpperCase(ExtractFileExt(Prj.DM_ProjectFullPath)) = '.PRJPCB') then
+        begin
+            Result := Prj;
+            Exit;
+        end;
+    for j := 0 to WS.DM_ProjectCount - 1 do
+        if (UpperCase(ExtractFileExt(WS.DM_Projects(j).DM_ProjectFullPath)) = '.PRJPCB') then
+        begin
+            Result := WS.DM_Projects(j);
+            Exit;
+        end;
+    Result := Prj;
+end;
+
+// Close the script editor's copies of the MCP's own script units. When a
+// script crashes, the debugger opens its unit in the editor, and from then
+// on RunScript runs that editor buffer instead of the file on disk: for the
+// sandbox an old script (or one that exits at once because its start marker
+// is gone), for the bridge units the code from before an extension update.
+// Unmodified copies only: closing a modified one would ask to save.
+// Answering at all also proves the script executor is alive.
+function CloseSandboxEditor(Dummy: Integer): String;
+var
+    i, j, Closed, Kept : Integer;
+    M      : IServerModule;
+    D      : IServerDocument;
+    Found  : Boolean;
+begin
+    Closed := 0;
+    Kept := 0;
+    Found := True;
+    while Found and (Closed < 10) do
+    begin
+        Found := False;
+        D := nil;
+        for i := 0 to Client.Count - 1 do
+        begin
+            M := Client.ServerModule[i];
+            if (M <> nil) then
+                for j := 0 to M.DocumentCount - 1 do
+                    if (D = nil) then
+                        if (M.Documents[j].Kind = 'EDITSCRIPTDS') then
+                            if (Pos('\SANDBOXSCRIPT\', UpperCase(M.Documents[j].FileName)) > 0) or
+                               (Pos('\ALTIUMSCRIPT\', UpperCase(M.Documents[j].FileName)) > 0) then
+                            begin
+                                if M.Documents[j].Modified then
+                                    Kept := Kept + 1
+                                else
+                                    D := M.Documents[j];
+                            end;
+        end;
+        if (D <> nil) then
+        begin
+            Client.CloseDocument(D);
+            Closed := Closed + 1;
+            Found := True;
+            Kept := 0;
+        end;
+    end;
+    Result := '{"closed": ' + IntToStr(Closed) + ', "kept_modified": ' + IntToStr(Kept) + '}';
+end;
+
+// True when a PCB (not a footprint library) is the document in front.
+// GetBoardSafe also finds boards open behind other tabs, which is right for
+// reading and editing but wrong for screenshots and zooming.
+function PcbInFront(Dummy: Integer): Boolean;
+var
+    Board : IPCB_Board;
+begin
+    Result := False;
+    if (PCBServer = nil) then Exit;
+    Board := PCBServer.GetCurrentPCBBoard;
+    if (Board = nil) then Exit;
+    Result := not Board.IsLibrary;
+end;
+
 {..............................................................................}
 { Get path of this script project.                                             }
 { Get prj path from Jeff Collins and William Kitchen's stripped down version   }
@@ -161,7 +268,12 @@ begin
        (CommandName = 'create_pcb_footprint') or
        (CommandName = 'get_project_info') or
        (CommandName = 'get_project_components') or
-       (CommandName = 'get_erc_violations') then
+       (CommandName = 'get_erc_violations') or
+       (CommandName = 'close_sandbox_editor') or
+       // The OutJob commands find (ResolveOutJob) and open their OutJob
+       // themselves, also one given by path that no project contains
+       (CommandName = 'get_output_job_containers') or
+       (CommandName = 'run_output_jobs') then
     begin
         Result := True;
         Exit;
@@ -252,10 +364,19 @@ begin
         Exit;
     end;
 
-    // Check if the correct document type is already focused
+    // Check if the correct document type is already focused. A screenshot
+    // needs the PCB in front; other commands accept a board behind other tabs
     if (DocumentKind = 'PCB') and (PCBServer <> Nil) then
     begin
-        if GetBoardSafe(0) <> Nil then
+        if (CommandName = 'take_view_screenshot') then
+        begin
+            if PcbInFront(0) then
+            begin
+                Result := True;
+                Exit;
+            end;
+        end
+        else if GetBoardSafe(0) <> Nil then
         begin
             Result := True;
             Exit;
@@ -361,12 +482,10 @@ begin
             end
             else if DocumentKind = 'OUTJOB' then
             begin
-                CurrentDoc := SchServer.GetCurrentSchDocument;
-                if (CurrentDoc <> Nil) then
-                begin
-                    Result := True;
-                    Exit;
-                end;
+                // An OutJob is not a schematic: SchServer may not even be
+                // loaded. Opening it is all the OutJob commands need.
+                Result := True;
+                Exit;
             end;
         End;
       End;
@@ -464,6 +583,9 @@ var
 begin
     // Default result
     Result := '{"success": false, "error": "Failed to initialize screenshot capture"}';
+    // The server finds and captures the window itself; nothing here looks
+    // for it, so report that honestly instead of an uninitialised value
+    WindowFound := False;
 
     // Determine what type of document we need to focus
     if LowerCase(ViewType) = 'pcb' then
@@ -478,7 +600,7 @@ begin
     end
     else
     begin
-        Result := '{"success": false, "error": "Invalid view type: ' + ViewType + '. Must be ''pcb'' or ''sch''"}';
+        Result := '{"success": false, "error": "Invalid view type: ' + JSONEscapeString(ViewType) + '. Must be ''pcb'' or ''sch''"}';
         Exit;
     end;
 
@@ -527,8 +649,48 @@ begin
     end;
 end;
 
-// Get all available output job containers from the first open OutJob
-function GetOutputJobContainers(ROOT_DIR: String): String;
+// The OutJob a command works on: the requested path when given, else the
+// OutJob of the active project, else the first OutJob of any open project.
+// '' when there is none.
+function ResolveOutJob(Requested: String): String;
+var
+    Prj : IProject;
+    I   : Integer;
+begin
+    Result := '';
+    if (Requested <> '') then
+    begin
+        if FileExists(Requested) then Result := Requested;
+        Exit;
+    end;
+    Prj := GetActiveProject(0);
+    if (Prj <> nil) then
+        for I := 0 to Prj.DM_LogicalDocumentCount - 1 do
+            if (Prj.DM_LogicalDocuments(I).DM_DocumentKind = 'OUTPUTJOB') then
+            begin
+                Result := Prj.DM_LogicalDocuments(I).DM_FullPath;
+                Exit;
+            end;
+    Result := GetOpenOutputJob();
+end;
+
+// Error object for the OutJob commands
+function OutJobError(Msg: String): String;
+var
+    ResultProps: TStringList;
+begin
+    ResultProps := TStringList.Create;
+    try
+        AddJSONBoolean(ResultProps, 'success', False);
+        AddJSONProperty(ResultProps, 'error', Msg);
+        Result := BuildJSONObject(ResultProps);
+    finally
+        ResultProps.Free;
+    end;
+end;
+
+// All output containers (media) of every output group of an OutJob
+function GetOutputJobContainers(ROOT_DIR: String; RequestedPath: String): String;
 var
     OutJobPath: String;
     IniFile: TIniFile;
@@ -540,96 +702,59 @@ var
     ContainerProps: TStringList;
     OutputLines: TStringList;
 begin
-    // Get the path of the first open OutJob
-    OutJobPath := GetOpenOutputJob();
-
-    // Exit if no open OutJob was found
+    OutJobPath := ResolveOutJob(RequestedPath);
     if OutJobPath = '' then
     begin
-        ResultProps := TStringList.Create;
-        try
-            AddJSONBoolean(ResultProps, 'success', False);
-            AddJSONProperty(ResultProps, 'error', 'No open OutJob document found');
-            Result := BuildJSONObject(ResultProps);
-        finally
-            ResultProps.Free;
-        end;
+        if (RequestedPath <> '') then
+            Result := OutJobError('OutJob not found: ' + RequestedPath)
+        else
+            Result := OutJobError('No OutJob found in the open projects');
         Exit;
     end;
 
-    // Create output containers array
     ResultProps := TStringList.Create;
     ContainersArray := TStringList.Create;
-
     try
-        // Add the OutJob path to the result
         AddJSONProperty(ResultProps, 'outjob_path', OutJobPath);
 
-        // Open the OutJob file (it's just an INI file)
+        // The OutJob is an INI file: OutputGroup1..N, each with
+        // OutputMedium1..M; the numbering has no gaps
         IniFile := TIniFile.Create(OutJobPath);
         try
-            G := 1; // Group Number
-            J := 1; // Job/Container Number
-            ContainerName := '';
-
-            // Iterate each Output Group
-            While (G = 1) Or (ContainerName <> DEFAULT) Do
-            Begin
-                S := 'OutputGroup'+IntToStr(G); // Section (aka OutputGroup)
-
-                // Reset J for each group
+            G := 1;
+            while (IniFile.ReadString('OutputGroup' + IntToStr(G), 'OutputMedium1', DEFAULT) <> DEFAULT) do
+            begin
+                S := 'OutputGroup' + IntToStr(G);
                 J := 1;
-                ContainerName := '';
-                ContainerAction := '';
-
-                // Iterate each Output Container
-                While (J = 1) Or (ContainerName <> DEFAULT) Do
-                Begin
-                    ContainerName := IniFile.ReadString(S, 'OutputMedium' + IntToStr(J), DEFAULT);
+                ContainerName := IniFile.ReadString(S, 'OutputMedium1', DEFAULT);
+                while (ContainerName <> DEFAULT) do
+                begin
                     ContainerAction := IniFile.ReadString(S, 'OutputMedium' + IntToStr(J) + '_Type', DEFAULT);
-
-                    // Add valid containers to the list
-                    if (ContainerName <> DEFAULT) then
-                    begin
-                        ContainerProps := TStringList.Create;
-                        try
-                            // Add container properties
-                            AddJSONProperty(ContainerProps, 'container_name', ContainerName);
-                            AddJSONProperty(ContainerProps, 'container_type', ContainerAction);
-                            //AddJSONProperty(ContainerProps, 'group', IntToStr(G));
-                            //AddJSONProperty(ContainerProps, 'container_id', IntToStr(J));
-
-                            // Add to containers array
-                            ContainersArray.Add(BuildJSONObject(ContainerProps, 1));
-                        finally
-                            ContainerProps.Free;
-                        end;
+                    ContainerProps := TStringList.Create;
+                    try
+                        AddJSONProperty(ContainerProps, 'container_name', ContainerName);
+                        AddJSONProperty(ContainerProps, 'container_type', ContainerAction);
+                        AddJSONInteger(ContainerProps, 'group', G);
+                        ContainersArray.Add(BuildJSONObject(ContainerProps, 1));
+                    finally
+                        ContainerProps.Free;
                     end;
-
-                    Inc(J);
-                    // Exit if we've reached the default value
-                    if ContainerName = DEFAULT then
-                        break;
-                End;
-
-                Inc(G);
-                // Exit if we've reached the default value after first group
-                if (G > 1) and (ContainerName = DEFAULT) then
-                    break;
-            End;
+                    J := J + 1;
+                    ContainerName := IniFile.ReadString(S, 'OutputMedium' + IntToStr(J), DEFAULT);
+                end;
+                G := G + 1;
+            end;
         finally
             IniFile.Free;
         end;
 
-        // Add success status and containers array to result
         AddJSONBoolean(ResultProps, 'success', True);
         ResultProps.Add(BuildJSONArray(ContainersArray, 'containers'));
 
-        // Build final JSON
         OutputLines := TStringList.Create;
         try
             OutputLines.Text := BuildJSONObject(ResultProps);
-            Result := WriteJSONToFile(OutputLines, ROOT_DIR);
+            Result := WriteJSONToFile(OutputLines, ROOT_DIR + 'temp_outjob_containers.json');
         finally
             OutputLines.Free;
         end;
@@ -639,8 +764,10 @@ begin
     end;
 end;
 
-// Run selected output job containers with simplified logic
-function RunOutputJobs(ContainerNames: TStringList, ROOT_DIR: String): String;
+// Run output containers of an OutJob by name. Altium's GenerateReport /
+// Print processes return nothing, so a container is reported as
+// "dispatched"; the server checks the output folder for new files.
+function RunOutputJobs(ContainerNames: TStringList; ROOT_DIR: String; RequestedPath: String): String;
 var
     OutJobPath: String;
     IniFile: TIniFile;
@@ -652,113 +779,80 @@ var
     ContainerResultProps: TStringList;
     I: Integer;
     ContainerFound: Boolean;
-    SuccessCount: Integer;
+    DispatchedCount: Integer;
     OutJobDoc: IServerDocument;
     OutputLines: TStringList;
 begin
-    // Get the path of the first open OutJob
-    OutJobPath := GetOpenOutputJob();
-
-    // Exit if no open OutJob was found
+    OutJobPath := ResolveOutJob(RequestedPath);
     if OutJobPath = '' then
     begin
-        ResultProps := TStringList.Create;
-        try
-            AddJSONBoolean(ResultProps, 'success', False);
-            AddJSONProperty(ResultProps, 'error', 'No open OutJob document found');
-            Result := BuildJSONObject(ResultProps);
-        finally
-            ResultProps.Free;
-        end;
+        if (RequestedPath <> '') then
+            Result := OutJobError('OutJob not found: ' + RequestedPath)
+        else
+            Result := OutJobError('No OutJob found in the open projects');
         Exit;
     end;
 
-    // Create results
+    // Never re-open a document that is already open: that reloads it from
+    // disk and drops unsaved edits. (Not OpenLibraryDocument: DelphiScript
+    // does not see a function defined further down the same unit.)
+    OutJobDoc := Client.GetDocumentByPath(OutJobPath);
+    if (OutJobDoc = nil) then
+        OutJobDoc := Client.OpenDocument('OUTPUTJOB', OutJobPath);
+    if (OutJobDoc = nil) then
+    begin
+        Result := OutJobError('Could not open OutJob document: ' + OutJobPath);
+        Exit;
+    end;
+
     ResultProps := TStringList.Create;
     ContainerResults := TStringList.Create;
-    SuccessCount := 0;
-
+    DispatchedCount := 0;
     try
-        // Add the OutJob path to the result
         AddJSONProperty(ResultProps, 'outjob_path', OutJobPath);
 
-        // Open the OutJob document
-        if not(Client.IsDocumentOpen(OutJobPath)) then
-        begin
-            OutJobDoc := Client.OpenDocument('OUTPUTJOB', OutJobPath);
-            OutJobDoc.Focus();
-        end
-        else
-        begin
-            OutJobDoc := Client.GetDocumentByPath(OutJobPath);
-            OutJobDoc.Focus();
-        end;
-
-        // Exit if we can't open the OutJob document
-        if OutJobDoc = Nil then
-        begin
-            AddJSONBoolean(ResultProps, 'success', False);
-            AddJSONProperty(ResultProps, 'error', 'Could not open OutJob document: ' + OutJobPath);
-            Result := BuildJSONObject(ResultProps);
-            Exit;
-        end;
-
-        // Open the OutJob file (it's just an INI file)
         IniFile := TIniFile.Create(OutJobPath);
         try
-            // Process each requested container
             for I := 0 to ContainerNames.Count - 1 do
             begin
                 ContainerFound := False;
                 ContainerResultProps := TStringList.Create;
-
                 try
-                    // Add container name to results
                     AddJSONProperty(ContainerResultProps, 'container_name', ContainerNames[I]);
 
-                    // Iterate through groups and containers to find the matching one
                     G := 1;
-                    while True do
+                    while (not ContainerFound) and
+                          (IniFile.ReadString('OutputGroup' + IntToStr(G), 'OutputMedium1', DEFAULT) <> DEFAULT) do
                     begin
-                        S := 'OutputGroup'+IntToStr(G);
-
+                        S := 'OutputGroup' + IntToStr(G);
                         J := 1;
-                        while True do
+                        ContainerName := IniFile.ReadString(S, 'OutputMedium1', DEFAULT);
+                        while (not ContainerFound) and (ContainerName <> DEFAULT) do
                         begin
-                            ContainerName := IniFile.ReadString(S, 'OutputMedium' + IntToStr(J), DEFAULT);
-
-                            // Exit inner loop if we've reached the default value
-                            if ContainerName = DEFAULT then
-                                break;
-
-                            // Check if this is one of the containers we want to run
                             if ContainerName = ContainerNames[I] then
                             begin
                                 ContainerFound := True;
                                 ContainerAction := IniFile.ReadString(S, 'OutputMedium' + IntToStr(J) + '_Type', DEFAULT);
                                 RelativePath := IniFile.ReadString('PublishSettings', 'OutputBasePath' + IntToStr(J), '');
 
-                                // Ensure document is focused
+                                // The output processes act on the OutJob in front
+                                Client.ShowDocument(OutJobDoc);
                                 OutJobDoc.Focus();
 
-                                // Run the container based on its type
                                 if ContainerAction = 'GeneratedFiles' then
                                 begin
-                                    // Run GenerateFiles
                                     ResetParameters;
                                     AddStringParameter('Action', 'Run');
                                     AddStringParameter('OutputMedium', ContainerName);
                                     AddStringParameter('ObjectKind', 'OutputBatch');
                                     AddStringParameter('OutputBasePath', RelativePath);
                                     RunProcess('WorkspaceManager:GenerateReport');
-
-                                    // Assume success
                                     AddJSONBoolean(ContainerResultProps, 'success', True);
-                                    SuccessCount := SuccessCount + 1;
+                                    AddJSONBoolean(ContainerResultProps, 'dispatched', True);
+                                    DispatchedCount := DispatchedCount + 1;
                                 end
                                 else if ContainerAction = 'Publish' then
                                 begin
-                                    // Run PublishToPDF with simpler parameters
                                     ResetParameters;
                                     AddStringParameter('Action', 'PublishToPDF');
                                     AddStringParameter('OutputMedium', ContainerName);
@@ -766,47 +860,31 @@ begin
                                     AddStringParameter('OutputBasePath', RelativePath);
                                     AddStringParameter('DisableDialog', 'True');
                                     RunProcess('WorkspaceManager:Print');
-
-                                    // Assume success
                                     AddJSONBoolean(ContainerResultProps, 'success', True);
-                                    SuccessCount := SuccessCount + 1;
+                                    AddJSONBoolean(ContainerResultProps, 'dispatched', True);
+                                    DispatchedCount := DispatchedCount + 1;
                                 end
                                 else
                                 begin
-                                    // Unknown action type
                                     AddJSONBoolean(ContainerResultProps, 'success', False);
-                                    AddJSONProperty(ContainerResultProps, 'error', 'Unknown container action type: ' + ContainerAction);
+                                    AddJSONProperty(ContainerResultProps, 'error', 'Unsupported container type: ' + ContainerAction);
                                 end;
-
-                                // Add output path info
+                                AddJSONInteger(ContainerResultProps, 'group', G);
+                                AddJSONProperty(ContainerResultProps, 'container_type', ContainerAction);
                                 AddJSONProperty(ContainerResultProps, 'relative_path', RelativePath);
-
-                                // Break out after processing the container
-                                break;
                             end;
-
-                            Inc(J);
+                            J := J + 1;
+                            ContainerName := IniFile.ReadString(S, 'OutputMedium' + IntToStr(J), DEFAULT);
                         end;
-
-                        // If we already found and processed the container, break out
-                        if ContainerFound then
-                            break;
-
-                        // Exit outer loop if we've processed all groups
-                        if ContainerName = DEFAULT then
-                            break;
-
-                        Inc(G);
+                        G := G + 1;
                     end;
 
-                    // Handle container not found
                     if not ContainerFound then
                     begin
                         AddJSONBoolean(ContainerResultProps, 'success', False);
                         AddJSONProperty(ContainerResultProps, 'error', 'Container not found: ' + ContainerNames[I]);
                     end;
 
-                    // Add this container result to the results array
                     ContainerResults.Add(BuildJSONObject(ContainerResultProps, 1));
                 finally
                     ContainerResultProps.Free;
@@ -816,17 +894,15 @@ begin
             IniFile.Free;
         end;
 
-        // Add summary results
-        AddJSONBoolean(ResultProps, 'success', SuccessCount > 0);
+        AddJSONBoolean(ResultProps, 'success', DispatchedCount > 0);
         AddJSONInteger(ResultProps, 'total_containers', ContainerNames.Count);
-        AddJSONInteger(ResultProps, 'successful_containers', SuccessCount);
+        AddJSONInteger(ResultProps, 'dispatched_containers', DispatchedCount);
         ResultProps.Add(BuildJSONArray(ContainerResults, 'container_results'));
 
-        // Build and return the final JSON result
         OutputLines := TStringList.Create;
         try
             OutputLines.Text := BuildJSONObject(ResultProps);
-            Result := WriteJSONToFile(OutputLines, ROOT_DIR);
+            Result := WriteJSONToFile(OutputLines, ROOT_DIR + 'temp_run_outjobs.json');
         finally
             OutputLines.Free;
         end;
@@ -990,10 +1066,12 @@ var
     OutputLines  : TStringList;
     OpenState    : String;
 begin
-    Project := GetWorkspace.DM_FocusedProject;
+    // The project of the active document (DM_FocusedProject is "Free
+    // Documents" or the script project while a script runs)
+    Project := GetActiveProject(0);
     if Project = Nil then
     begin
-        Result := 'ERROR: No focused project';
+        Result := 'ERROR: No project is open';
         Exit;
     end;
 
@@ -1099,10 +1177,12 @@ var
     ItemProps   : TStringList;
     OutputLines : TStringList;
 begin
-    Project := GetWorkspace.DM_FocusedProject;
+    // The project of the active document (DM_FocusedProject is "Free
+    // Documents" or the script project while a script runs)
+    Project := GetActiveProject(0);
     if Project = Nil then
     begin
-        Result := 'ERROR: No focused project';
+        Result := 'ERROR: No project is open';
         Exit;
     end;
 
@@ -1167,10 +1247,12 @@ var
     ResultProps : TStringList;
     OutputLines : TStringList;
 begin
-    Project := GetWorkspace.DM_FocusedProject;
+    // The project of the active document (DM_FocusedProject is "Free
+    // Documents" or the script project while a script runs)
+    Project := GetActiveProject(0);
     if Project = Nil then
     begin
-        Result := 'ERROR: No focused project';
+        Result := 'ERROR: No project is open';
         Exit;
     end;
     Project.DM_Compile;

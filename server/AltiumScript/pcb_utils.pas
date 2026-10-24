@@ -3,11 +3,40 @@
 // GetCurrentPCBBoard on it throws an access violation that leaves the
 // script paused in the debugger - silently blocking every later script run.
 // All board lookups must go through this helper.
+//
+// When the active tab is not a PCB (the user clicked another document, DRC
+// opened its report ...) it falls back to the open board of the focused
+// project, then of any open project, looked up by path.
 function GetBoardSafe(Dummy: Integer): IPCB_Board;
+var
+    WS      : IWorkspace;
+    Prj     : IProject;
+    i, j    : Integer;
 begin
     Result := nil;
-    if (PCBServer <> nil) then
-        Result := PCBServer.GetCurrentPCBBoard;
+    if (PCBServer = nil) then Exit;
+    Result := PCBServer.GetCurrentPCBBoard;
+    // With a PcbLib in front this is the library's board: board tools must
+    // never place, move or edit inside a footprint library
+    if (Result <> nil) then
+        if Result.IsLibrary then
+            Result := nil;
+    if (Result <> nil) then Exit;
+
+    WS := GetWorkspace;
+    if (WS = nil) then Exit;
+    Prj := WS.DM_FocusedProject;
+    if (Prj <> nil) then
+        for i := 0 to Prj.DM_LogicalDocumentCount - 1 do
+            if (Result = nil) and (UpperCase(Prj.DM_LogicalDocuments(i).DM_DocumentKind) = 'PCB') then
+                Result := PCBServer.GetPCBBoardByPath(Prj.DM_LogicalDocuments(i).DM_FullPath);
+    for j := 0 to WS.DM_ProjectCount - 1 do
+    begin
+        Prj := WS.DM_Projects(j);
+        for i := 0 to Prj.DM_LogicalDocumentCount - 1 do
+            if (Result = nil) and (UpperCase(Prj.DM_LogicalDocuments(i).DM_DocumentKind) = 'PCB') then
+                Result := PCBServer.GetPCBBoardByPath(Prj.DM_LogicalDocuments(i).DM_FullPath);
+    end;
 end;
 
 // Nil-safe access to the current PCB library (same hazard as GetBoardSafe)
@@ -742,7 +771,7 @@ begin
                 AddJSONProperty(LayerProps, 'layer_id', Layer2String(LayerObject.LayerID));
                 AddJSONProperty(LayerProps, 'material_type', 'Copper');
                 AddJSONNumber(LayerProps, 'copper_thickness_mils', LayerObject.CopperThickness / 10000);
-                AddJSONNumber(LayerProps, 'copper_thickness_um', LayerObject.CopperThickness / 254);
+                AddJSONNumber(LayerProps, 'copper_thickness_um', CoordToMMs(LayerObject.CopperThickness) * 1000);
                 
                 // Add copper thickness to total
                 TotalThickness := TotalThickness + (LayerObject.CopperThickness / 10000);
@@ -760,7 +789,7 @@ begin
                     
                     AddJSONProperty(LayerProps, 'dielectric_material', LayerObject.Dielectric.DielectricMaterial);
                     AddJSONNumber(LayerProps, 'dielectric_height_mils', LayerObject.Dielectric.DielectricHeight / 10000);
-                    AddJSONNumber(LayerProps, 'dielectric_height_um', LayerObject.Dielectric.DielectricHeight / 254);
+                    AddJSONNumber(LayerProps, 'dielectric_height_um', CoordToMMs(LayerObject.Dielectric.DielectricHeight) * 1000);
                     AddJSONNumber(LayerProps, 'dielectric_constant', LayerObject.Dielectric.DielectricConstant);
                     
                     // Add dielectric thickness to total
@@ -826,6 +855,7 @@ var
     OtherArray      : TStringList;
     LayerProps      : TStringList;
     i               : Integer;
+    MechCount       : Integer;
     OutputLines     : TStringList;
 begin
     Result := '';
@@ -1072,12 +1102,13 @@ begin
             AddJSONInteger(LayerProps, 'signal_layers_count', TheLayerStack.SignalLayerCount);
             AddJSONInteger(LayerProps, 'internal_planes_count', TheLayerStack.LayersInStackCount - TheLayerStack.SignalLayerCount);
             
-            // Get the number of enabled mechanical layers
-            i := 0;
+            // Get the number of enabled mechanical layers. A separate counter:
+            // bumping the loop variable skipped layers and always gave ~33
+            MechCount := 0;
             for i := 1 to 32 do
                 if TheLayerStack.LayerObject_V7[ILayer.MechanicalLayer(i)].MechanicalLayerEnabled then
-                    i := i + 1;
-            AddJSONInteger(LayerProps, 'mechanical_layers_count', i);
+                    MechCount := MechCount + 1;
+            AddJSONInteger(LayerProps, 'mechanical_layers_count', MechCount);
             
             // Add the layer arrays
             LayerProps.Add(BuildJSONArray(CopperArray, 'copper_layers'));
@@ -1783,7 +1814,7 @@ begin
     Component := Board.GetPcbComponentByRefDes(Designator);
     if (Component = nil) then
     begin
-        Result := '{"success": false, "error": "Component not found: ' + Designator + '"}';
+        Result := '{"success": false, "error": "Component not found: ' + JSONEscapeString(Designator) + '"}';
         Exit;
     end;
     
@@ -1810,9 +1841,9 @@ begin
         Client.SendMessage('PCB:Zoom', 'Action=Redraw', 255, Client.CurrentView);
         
         AddJSONProperty(ResultProps, 'designator', Designator);
-        AddJSONProperty(ResultProps, 'new_x', FloatToStr(NewX), False);
-        AddJSONProperty(ResultProps, 'new_y', FloatToStr(NewY), False);
-        AddJSONProperty(ResultProps, 'rotation', FloatToStr(Component.Rotation), False);
+        AddJSONNumber(ResultProps, 'new_x', NewX);
+        AddJSONNumber(ResultProps, 'new_y', NewY);
+        AddJSONNumber(ResultProps, 'rotation', Component.Rotation);
         
         Result := '{"success": true, "result": ' + BuildJSONObject(ResultProps) + '}';
     finally
@@ -1898,7 +1929,7 @@ begin
             if ShapeStr = 'Round' then
                 PadShape := eRounded
             else if ShapeStr = 'Oval' then
-                PadShape := eRoundedRectangle
+                PadShape := eRounded
             else
                 PadShape := eRectangular;
 

@@ -25,21 +25,22 @@ Usage:
     python dev/unwedge.py            # stop debugger, close dialogs, verify
     python dev/unwedge.py --no-verify
 """
-import ctypes
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from capture_window import find_windows, _title, _class
+from capture_window import find_windows, _title
 
 REPO = Path(__file__).resolve().parent.parent
 EXCHANGE = Path("C:/Users/Public/altium_mcp")
 PROBE_PRJ = REPO / "dev" / "sandbox" / "Sandbox.PrjScr"
 PROBE_RESULT = EXCHANGE / "sandbox_result.json"
-CONFIG = EXCHANGE / "altium_config.json"
+# The server's config.json (outside the extension folder, see main.py)
+CONFIG = Path(os.environ.get("ALTIUM_MCP_HOME") or Path.home() / ".altium-mcp") / "config.json"
 
 
 def altium_exe():
@@ -61,16 +62,17 @@ def altium_exe():
 
 
 def close_dialogs():
-    """Close modal error dialogs. They block input and can mask the wedge."""
-    def is_dialog(h):
-        cls = _class(h)
-        return cls == "#32770" or (
-            cls == "TMessageForm" and _title(h) in
-            ("Error", "Warning", "Information", "Confirm"))
-    hits = find_windows(is_dialog)
-    for h in hits:
-        ctypes.windll.user32.PostMessageW(h, 0x0010, 0, 0)  # WM_CLOSE
-    return len(hits)
+    """Close Altium's acknowledgement boxes (an OK-only error or notice).
+
+    Same allowlist as the server: a question (Yes/No, OK/Cancel - a save or
+    reload prompt) is left for the user, and only X2.EXE windows are touched.
+    """
+    sys.path.insert(0, str(REPO / "server"))
+    from altium_runtime import close_dialogs as close_altium_dialogs
+    closed, waiting = close_altium_dialogs()
+    for d in waiting:
+        print(f"  left open, answer it in Altium: '{d['title']}' [{'/'.join(d['buttons'])}]")
+    return len(closed)
 
 
 def stop_via_process():
