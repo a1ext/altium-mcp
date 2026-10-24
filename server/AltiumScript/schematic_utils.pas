@@ -53,9 +53,16 @@ var
     PinX, PinY       : Integer;
 begin
     Result := '';
-    
+
     // Check if we have a schematic library document
-    CurrentLib := SchServer.GetCurrentSchDocument;
+    CurrentLib := nil;
+    if (SchServer <> nil) then
+        CurrentLib := SchServer.GetCurrentSchDocument;
+    if (CurrentLib = nil) then
+    begin
+        Result := 'ERROR: Please open a schematic library document';
+        Exit;
+    end;
     if (CurrentLib.ObjectID <> eSchLib) Then
     begin
         Result := 'ERROR: Please open a schematic library document';
@@ -204,7 +211,14 @@ var
     OutputLines      : TStringList;
 begin
     // Check if we have a schematic library document
-    CurrentLib := SchServer.GetCurrentSchDocument;
+    CurrentLib := nil;
+    if (SchServer <> nil) then
+        CurrentLib := SchServer.GetCurrentSchDocument;
+    if (CurrentLib = nil) then
+    begin
+        Result := 'ERROR: Please open a schematic library document';
+        Exit;
+    end;
     if (CurrentLib.ObjectID <> eSchLib) Then
     begin
         Result := 'ERROR: Please open a schematic library document';
@@ -613,7 +627,6 @@ var
     LibRefUpper      : String;
     MatchCount       : Integer;
     ServerDoc        : IServerDocument;
-    OpenDlg          : TOpenDialog;
     NeedToOpen       : Boolean;
 begin
     Result := '';
@@ -642,24 +655,12 @@ begin
             NeedToOpen := True;
     end;
 
-    // If we need to open a library and no path was given, prompt the user
+    // No library to search. A file dialog here would block the script until
+    // a human answers it, and every later request would time out meanwhile
     if NeedToOpen and (LibraryPath = '') then
     begin
-        OpenDlg := TOpenDialog.Create(nil);
-        try
-            OpenDlg.Title := 'Select Schematic Library (.SchLib)';
-            OpenDlg.Filter := 'Schematic Library (*.SchLib)|*.SchLib|All Files (*.*)|*.*';
-            OpenDlg.FilterIndex := 1;
-            if OpenDlg.Execute then
-                LibraryPath := OpenDlg.FileName
-            else
-            begin
-                Result := 'ERROR: No library selected. User cancelled the file browser.';
-                Exit;
-            end;
-        finally
-            OpenDlg.Free;
-        end;
+        Result := 'ERROR: No schematic library is open; pass library_path (full path to a .SchLib)';
+        Exit;
     end;
 
     // Open the library if we have a path
@@ -1311,11 +1312,13 @@ var
 begin
     Result := '';
 
-    // Retrieve the current project
-    Project := GetWorkspace.DM_FocusedProject;
+    // The project of the active document: DM_FocusedProject is "Free
+    // Documents" or the script project while a script runs. Never ShowMessage:
+    // a modal box blocks the script until a human clicks it
+    Project := GetActiveProject(0);
     If (Project = Nil) Then
     begin
-        ShowMessage('Error: No project is currently open');
+        Result := 'ERROR: No project is currently open';
         Exit;
     end;
 
@@ -1339,9 +1342,14 @@ begin
             Doc := Project.DM_LogicalDocuments(i);
             If Doc.DM_DocumentKind = 'SCH' Then
             Begin
-                // Open the schematic document
-                Client.OpenDocument('SCH', Doc.DM_FullPath);
+                // Open the sheet only when it is not open yet: re-opening an
+                // open document reloads it from disk and drops unsaved edits
                 CurrentSch := SchServer.GetSchDocumentByPath(Doc.DM_FullPath);
+                If (CurrentSch = Nil) Then
+                begin
+                    OpenLibraryDocument('SCH', Doc.DM_FullPath);
+                    CurrentSch := SchServer.GetSchDocumentByPath(Doc.DM_FullPath);
+                end;
 
                 If (CurrentSch <> Nil) Then
                 Begin
@@ -1371,7 +1379,7 @@ begin
                             bottom := FloatToStr(CoordToMils(Rect.Bottom));
 
                             width := FloatToStr(CoordToMils(Rect.Right - Rect.Left));
-                            height := FloatToStr(CoordToMils(Rect.Bottom - Rect.Top));
+                            height := FloatToStr(CoordToMils(Abs(Rect.Bottom - Rect.Top)));
 
                             If Component.Orientation = eRotate0 Then
                                 rotation := '0'
@@ -1689,6 +1697,7 @@ var
     i, fld, vtx, PartCount, GfxCount, PinCount : Integer;
     HotX, HotY : Integer;
     Exists : Boolean;
+    LibOk : Boolean;
 begin
     Result := '{"success": false, "error": "build did not run"}';
 
@@ -1798,18 +1807,30 @@ begin
                 OpenLibraryDocument('SchLib', CurLib);
                 Sleep(700);
             end;
-            LibDoc := SchServer.GetCurrentSchDocument;
+            // Look the library up by path: when it failed to open, the
+            // current document is still the target sheet, and a library
+            // iterator on a sheet is a runtime error
+            LibDoc := SchServer.GetSchDocumentByPath(CurLib);
+            if (LibDoc = nil) then
+                LibDoc := SchServer.GetCurrentSchDocument;
+            LibOk := False;
+            if (LibDoc <> nil) then
+                if (LibDoc.ObjectID = eSchLib) then
+                    LibOk := True;
 
             Found := nil;
-            Iter := LibDoc.SchLibIterator_Create;
-            Iter.AddFilter_ObjectSet(MkSet(eSchComponent));
-            Prim := Iter.FirstSchObject;
-            while (Prim <> nil) do
+            if LibOk then
             begin
-                if (Prim.LibReference = GetFieldFromPipeString(Rec, 3)) then Found := Prim;
-                Prim := Iter.NextSchObject;
+                Iter := LibDoc.SchLibIterator_Create;
+                Iter.AddFilter_ObjectSet(MkSet(eSchComponent));
+                Prim := Iter.FirstSchObject;
+                while (Prim <> nil) do
+                begin
+                    if (Prim.LibReference = GetFieldFromPipeString(Rec, 3)) then Found := Prim;
+                    Prim := Iter.NextSchObject;
+                end;
+                LibDoc.SchIterator_Destroy(Iter);
             end;
-            LibDoc.SchIterator_Destroy(Iter);
 
             if (Found = nil) then
             begin

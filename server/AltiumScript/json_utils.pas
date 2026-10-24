@@ -23,6 +23,10 @@ end;
 
 // Helper function to escape JSON strings
 function JSONEscapeString(const S: String): String;
+var
+    i, Code : Integer;
+    Clean   : Boolean;
+    T       : String;
 begin
     Result := StringReplace(S, '\', '\\', REPLACEALL);
     Result := StringReplace(Result, '"', '\"', REPLACEALL);
@@ -30,6 +34,24 @@ begin
     Result := StringReplace(Result, #10, '\n', REPLACEALL);
     Result := StringReplace(Result, #13, '\n', REPLACEALL);
     Result := StringReplace(Result, #9, '\t', REPLACEALL);
+
+    // Any other control character (pad names may carry them) is invalid
+    // inside a JSON string and makes the whole response unparseable
+    Clean := True;
+    for i := 1 to Length(Result) do
+        if (Ord(Result[i]) < 32) then
+            Clean := False;
+    if Clean then Exit;
+    T := '';
+    for i := 1 to Length(Result) do
+    begin
+        Code := Ord(Result[i]);
+        if (Code < 32) then
+            T := T + '\u' + IntToHex(Code, 4)
+        else
+            T := T + Result[i];
+    end;
+    Result := T;
 end;
 
 // Function to create a JSON name-value pair
@@ -110,11 +132,20 @@ end;
 function WriteJSONToFile(JSON: TStringList; FileName: String = ''): String;
 var
     TempFile: String;
+    AutoName: Boolean;
 begin
-    // Use provided filename or generate temp filename
-    if Not(AnsiEndsStr('.json', LowerCase(FileName))) then
+    // Use the provided .json filename; anything else is a folder (empty = the
+    // shared exchange folder) that gets a temporary file, removed afterwards
+    AutoName := Not(AnsiEndsStr('.json', LowerCase(FileName)));
+    if AutoName then
     begin
-        TempFile := Path + 'temp_json_output.json';
+        if FileName = '' then
+            TempFile := 'C:\Users\Public\altium_mcp\'
+        else
+            TempFile := FileName;
+        if Not(AnsiEndsStr('\', TempFile)) then
+            TempFile := TempFile + '\';
+        TempFile := TempFile + 'temp_json_output.json';
     end
     else
     begin
@@ -131,7 +162,7 @@ begin
         Result := JSON.Text;
         
         // Clean up temporary file if auto-generated
-        if (FileName = '') and FileExists(TempFile) then
+        if AutoName and FileExists(TempFile) then
             DeleteFile(TempFile);
     except
         Result := '{"error": "Failed to write JSON to file"}';
@@ -221,4 +252,117 @@ begin
     if (Length(S) >= 2) and (Copy(S, 1, 1) = '"') and (Copy(S, Length(S), 1) = '"') then
         S := Copy(S, 2, Length(S) - 2);
     Result := JSONUnescape(S);
+end;
+
+// --- Request parameters --------------------------------------------------
+// The server writes request.json with json.dump(indent=2): every top-level
+// key starts its own line with exactly two spaces of indent, and every array
+// element sits on its own line. Matching that exact prefix means a value
+// that happens to look like a key ("x", "designators") is never mistaken
+// for one.
+
+// Index of the line holding top-level Key, -1 if the request has none
+function ReqLine(RequestData: TStringList; Key: String): Integer;
+var
+    i      : Integer;
+    Prefix : String;
+begin
+    Result := -1;
+    Prefix := '  "' + Key + '":';
+    for i := 0 to RequestData.Count - 1 do
+        if (Copy(RequestData[i], 1, Length(Prefix)) = Prefix) then
+        begin
+            Result := i;
+            Exit;
+        end;
+end;
+
+// Decoded string value of a top-level key, Fallback when absent
+function ReqString(RequestData: TStringList; Key: String; Fallback: String): String;
+var
+    i : Integer;
+begin
+    i := ReqLine(RequestData, Key);
+    if (i < 0) then
+        Result := Fallback
+    else
+        Result := JSONLineValue(RequestData[i]);
+end;
+
+// True when S is a plain JSON number. StrToFloat on anything else raises a
+// conversion error that try/except does not catch in DelphiScript
+function IsJSONNumber(S: String): Boolean;
+var
+    i : Integer;
+    C : String;
+begin
+    Result := (S <> '');
+    for i := 1 to Length(S) do
+    begin
+        C := Copy(S, i, 1);
+        if (Pos(C, '0123456789.-+eE') = 0) then
+            Result := False;
+    end;
+end;
+
+function ReqFloat(RequestData: TStringList; Key: String; Fallback: Double): Double;
+var
+    S : String;
+begin
+    S := ReqString(RequestData, Key, '');
+    if IsJSONNumber(S) then
+        Result := SafeStrToFloat(S)
+    else
+        Result := Fallback;
+end;
+
+function ReqInt(RequestData: TStringList; Key: String; Fallback: Integer): Integer;
+var
+    S : String;
+begin
+    S := ReqString(RequestData, Key, '');
+    if IsJSONNumber(S) then
+        Result := Round(SafeStrToFloat(S))
+    else
+        Result := Fallback;
+end;
+
+function ReqBool(RequestData: TStringList; Key: String; Fallback: Boolean): Boolean;
+var
+    S : String;
+begin
+    S := LowerCase(ReqString(RequestData, Key, ''));
+    if (S = 'true') then
+        Result := True
+    else if (S = 'false') then
+        Result := False
+    else
+        Result := Fallback;
+end;
+
+// Elements of a top-level array of strings (or numbers), decoded, added to
+// Items. Handles "key": [] on one line; an element may contain commas,
+// brackets and escapes. Returns False when the key is absent.
+function ReqArray(RequestData: TStringList; Key: String; Items: TStringList): Boolean;
+var
+    i : Integer;
+    V : String;
+begin
+    i := ReqLine(RequestData, Key);
+    Result := (i >= 0);
+    if (i < 0) then Exit;
+    if (Pos('[]', RequestData[i]) > 0) then Exit;
+    i := i + 1;
+    while (i < RequestData.Count) do
+    begin
+        V := Trim(RequestData[i]);
+        if (V = ']') or (V = '],') then Exit;
+        if (Copy(V, Length(V), 1) = ',') then
+            V := Trim(Copy(V, 1, Length(V) - 1));
+        if (Length(V) >= 2) and (Copy(V, 1, 1) = '"') and (Copy(V, Length(V), 1) = '"') then
+            V := JSONUnescape(Copy(V, 2, Length(V) - 2));
+        if (V <> '') then
+            Items.Add(V);
+        i := i + 1;
+    end;
 end;

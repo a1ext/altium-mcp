@@ -4,47 +4,48 @@ var
     Iterator       : IPCB_BoardIterator;
     OrigObj, NewObj : IPCB_Primitive;
     DuplicatedObjects : TObjectList;
-    temp: String;
+    Originals      : TObjectList;
+    i              : Integer;
 begin
     // Create object list to store duplicated objects
     DuplicatedObjects := CreateObject(TObjectList);
     DuplicatedObjects.OwnsObjects := False; // Don't destroy objects when list is freed
-    
-    // Create iterator for the specified object type
+
+    // Collect the selected objects first and only then add the copies:
+    // adding objects while a board iterator runs makes it visit the new ones
+    // too (they are selected replicas), which never ends
+    Originals := CreateObject(TObjectList);
+    Originals.OwnsObjects := False;
     Iterator := Board.BoardIterator_Create;
     Iterator.AddFilter_ObjectSet(ObjectSet);
     Iterator.AddFilter_IPCB_LayerSet(LayerSet.AllLayers);
     Iterator.AddFilter_Method(eProcessAll);
-
-    PCBServer.PreProcess;
-    
     OrigObj := Iterator.FirstPCBObject;
     while (OrigObj <> Nil) do
     begin
         if OrigObj.Selected then
+            Originals.Add(OrigObj);
+        OrigObj := Iterator.NextPCBObject;
+    end;
+    Board.BoardIterator_Destroy(Iterator);
+
+    PCBServer.PreProcess;
+    try
+        for i := 0 to Originals.Count - 1 do
         begin
-            // Replicate the object
-            NewObj := PCBServer.PCBObjectFactory(OrigObj.ObjectId, eNoDimension, eCreate_Default);
+            OrigObj := Originals[i];
             NewObj := OrigObj.Replicate;
 
-            // Add to board
             PCBServer.SendMessageToRobots(NewObj.I_ObjectAddress, c_Broadcast, PCBM_BeginModify, c_NoEventData);
             Board.AddPCBObject(NewObj);
             PCBServer.SendMessageToRobots(NewObj.I_ObjectAddress, c_Broadcast, PCBM_EndModify, c_NoEventData);
 
-            // Send board registration message
-            //PCBServer.SendMessageToRobots(Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, NewObj.I_ObjectAddress);
-            
-            // Add to our list of duplicated objects
             DuplicatedObjects.Add(NewObj);
         end;
-        
-        OrigObj := Iterator.NextPCBObject;
+    finally
+        PCBServer.PostProcess;
+        Originals.Free;
     end;
-    
-    Board.BoardIterator_Destroy(Iterator);
-
-    PCBServer.PostProcess;
 
     Board.ViewManager_FullUpdate();  
     
@@ -356,10 +357,11 @@ begin
     end;
 end;
 
-// Function to check if two points are within tolerance
+// Function to check if two points are within tolerance (1 mil). The caller's
+// local Tolerance is not visible here: DelphiScript has no nested scopes.
 function CheckWithTolerance(X1, Y1, X2, Y2 : TCoord) : Boolean;
 begin
-    if (Abs(X1 - X2) <= Tolerance) and (Abs(Y1 - Y2) <= Tolerance) then
+    if (Abs(X1 - X2) <= MilsToCoord(1)) and (Abs(Y1 - Y2) <= MilsToCoord(1)) then
         Result := True
     else
         Result := False;
